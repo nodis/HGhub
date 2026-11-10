@@ -1,0 +1,152 @@
+name: Build Android APK
+
+# 自用出包工作流：手动触发，单 ABI 编译，自动签名。
+# 独立于上游的 release.yml，避免以后同步上游改动时冲突。
+#
+# 与上游 android job 的两处关键差异：
+#   1. 上游写的是 `--target aarch64 armv7 x86_64`，Tauri CLI 的 --target 只认
+#      逗号分隔的多值，空格分隔会被当成多余的位置参数而报错；此处改为单值。
+#   2. 上游强制要求 4 个签名 secret，缺一个就 exit 1。此处改为：有 secret 就用，
+#      没有就现场生成一张自用证书，开箱即用。
+
+on:
+  workflow_dispatch:
+    inputs:
+      abi:
+        description: "目标 ABI（vivo/绝大多数国产机选 aarch64）"
+        required: true
+        default: aarch64
+        type: choice
+        options:
+          - aarch64
+          - armv7
+          - x86_64
+          - i686
+
+concurrency:
+  group: android-apk-${{ github.ref }}-${{ inputs.abi }}
+  cancel-in-progress: true
+
+env:
+  CI: "true"
+
+jobs:
+  android:
+    name: Android APK (${{ inputs.abi }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 读取版本号
+        id: ver
+        run: |
+          V="$(node -p "require('./src-tauri/tauri.conf.json').version")"
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "打包版本 $V，目标 ABI ${{ inputs.abi }}"
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      # ubuntu runner 自带 Android SDK，不再调 android-actions/setup-android，
+      # 它的 license 交互会卡住。SDK 与 NDK 版本对齐上游 release.yml。
+      - name: 准备 Android SDK / NDK
+        run: |
+          set -euo pipefail
+          SDK="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+          SDKM="$SDK/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKM" --licenses > /dev/null 2>&1 || true
+          "$SDKM" --install "platform-tools" "platforms;android-36" "build-tools;36.0.0" "ndk;28.2.13676358"
+          echo "NDK_HOME=$SDK/ndk/28.2.13676358" >> "$GITHUB_ENV"
+          ls "$SDK/ndk"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android,i686-linux-android
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+          key: android-${{ inputs.abi }}
+
+      - name: 安装前端依赖
+        run: pnpm install --frozen-lockfile
+
+      - name: 生成 Android 工程
+        run: pnpm tauri android init --ci
+
+      - name: 编译 APK
+        run: pnpm tauri android build --apk --target ${{ inputs.abi }}
+
+      - name: 签名 APK
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEY_BASE64 }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          STORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          VERSION: ${{ steps.ver.outputs.version }}
+          ABI: ${{ inputs.abi }}
+        run: |
+          set -euo pipefail
+          KS="$RUNNER_TEMP/hghub.keystore"
+
+          # 有 secret 就复用固定证书，保证以后升级能覆盖安装；没有就现场生成一张。
+          if [ -n "${KEYSTORE_BASE64:-}" ]; then
+            echo "使用仓库 secret 中的固定证书"
+            echo "$KEYSTORE_BASE64" | base64 -d > "$KS"
+            KS_ALIAS="${KEY_ALIAS:?缺少 ANDROID_KEY_ALIAS}"
+            KS_STORE_PASS="${STORE_PASSWORD:?缺少 ANDROID_KEYSTORE_PASSWORD}"
+            KS_KEY_PASS="${KEY_PASSWORD:?缺少 ANDROID_KEY_PASSWORD}"
+          else
+            echo "未配置 secret，生成一次性自用证书"
+            KS_ALIAS="hghub"
+            KS_STORE_PASS="hghub-$(echo "$VERSION" | tr -d '.')"
+            KS_KEY_PASS="$KS_STORE_PASS"
+            keytool -genkeypair -v -keystore "$KS" -alias "$KS_ALIAS" \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -storepass "$KS_STORE_PASS" -keypass "$KS_KEY_PASS" \
+              -dname "CN=HGhub, OU=Self, O=Self, L=Jinan, ST=Shandong, C=CN" > /dev/null 2>&1
+          fi
+
+          BT="$(ls "$ANDROID_SDK_ROOT/build-tools" | sort -V | tail -1)"
+          APKSIGNER="$ANDROID_SDK_ROOT/build-tools/$BT/apksigner"
+          mkdir -p out
+          n=0
+          for f in $(find src-tauri/gen/android/app/build/outputs/apk -name '*.apk' -type f); do
+            out="out/HGhub_${VERSION}_${ABI}.apk"
+            [ "$n" -eq 0 ] || out="out/HGhub_${VERSION}_${ABI}_${n}.apk"
+            "$APKSIGNER" sign \
+              --ks "$KS" --ks-key-alias "$KS_ALIAS" \
+              --ks-pass "pass:$KS_STORE_PASS" --key-pass "pass:$KS_KEY_PASS" \
+              --v4-signing-enabled false \
+              --out "$out" "$f"
+            "$APKSIGNER" verify --print-certs "$out" | head -3
+            n=$((n+1))
+          done
+
+          if [ "$n" -eq 0 ]; then
+            echo "::error::没有找到编译出来的 APK"
+            find src-tauri/gen/android/app/build/outputs -type f | head -50
+            exit 1
+          fi
+          ls -lh out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: HGhub-android-${{ inputs.abi }}
+          path: out/*.apk
+          if-no-files-found: error
+          retention-days: 30
