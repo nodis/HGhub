@@ -1,0 +1,260 @@
+name: 跟进上游并出包
+
+# 每6小时检查上游 Minireel/HGhub 的 main 分支。
+# 有实质更新（.github/workflows 之外的改动）就同步、构建、发 Release、推企业微信。
+# 无更新则直接结束，不消耗构建时间。
+
+on:
+  schedule:
+    # UTC 1/7/13/19 点 = 北京时间 9/15/21/3 点。避开整点，减少排队延迟。
+    - cron: "17 1,7,13,19 * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "强制构建一次（跳过上游对比）"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+env:
+  CI: "true"
+  UPSTREAM: Minireel/HGhub
+
+jobs:
+  sync:
+    name: 检查上游
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.diff.outputs.changed }}
+      sha: ${{ steps.diff.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 与上游对比
+        id: diff
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream "https://github.com/${UPSTREAM}.git" || true
+          git fetch --depth=1 upstream main
+          USHA="$(git rev-parse upstream/main)"
+          echo "sha=$USHA" >> "$GITHUB_OUTPUT"
+          echo "上游 head: $USHA"
+
+          if [ "${{ inputs.force }}" = "true" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "手动要求强制构建"
+            exit 0
+          fi
+
+          # 只看代码，不比工作流目录：我们自己加的文件不参与判定
+          if git diff --quiet HEAD upstream/main -- . ':(exclude).github/workflows'; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "上游无实质更新，跳过"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "上游有更新，改动概览："
+            git diff --stat HEAD upstream/main -- . ':(exclude).github/workflows' | tail -25
+          fi
+
+      - name: 同步上游代码
+        if: steps.diff.outputs.changed == 'true'
+        env:
+          USHA: ${{ steps.diff.outputs.sha }}
+        run: |
+          set -euo pipefail
+          git checkout upstream/main -- . ':(exclude).github/workflows'
+          if git diff --cached --quiet; then
+            echo "内容无变化（可能只有工作流差异），不提交"
+            exit 0
+          fi
+          git commit -m "chore: 同步上游 ${UPSTREAM} ${USHA:0:7}"
+          git push origin HEAD:main
+
+  build:
+    name: 构建 APK
+    needs: sync
+    if: needs.sync.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: 读取版本
+        id: ver
+        env:
+          USHA: ${{ needs.sync.outputs.sha }}
+        run: |
+          V="$(node -p "require('./src-tauri/tauri.conf.json').version")"
+          SHA7="${USHA:0:7}"
+          TAG="auto-$(date -u +%Y%m%d)-${SHA7}"
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "sha7=$SHA7" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "版本 $V，上游 $SHA7"
+
+      - name: 通知上游有更新
+        env:
+          WECOM: ${{ secrets.WECOM_WEBHOOK }}
+          VERSION: ${{ steps.ver.outputs.version }}
+          SHA7: ${{ steps.ver.outputs.sha7 }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          [ -n "${WECOM:-}" ] || { echo "未配置 WECOM_WEBHOOK，跳过"; exit 0; }
+          CONTENT="## HGhub 检测到上游更新
+          > 上游提交：${SHA7}
+          > 客户端版本：${VERSION}
+          > 已开始构建，约需 5 到 10 分钟，出包后再推一条
+
+          [构建进度](${RUN_URL})"
+          PAYLOAD="$(python3 -c 'import json,sys;print(json.dumps({"msgtype":"markdown","markdown":{"content":sys.argv[1]}}))' "$CONTENT")"
+          curl -sS -X POST "$WECOM" -H 'Content-Type: application/json' -d "$PAYLOAD" | head -c 300
+          echo
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: 准备 Android SDK / NDK
+        run: |
+          set -euo pipefail
+          SDK="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+          SDKM="$SDK/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKM" --licenses > /dev/null 2>&1 || true
+          "$SDKM" --install "platform-tools" "platforms;android-36" "build-tools;36.0.0" "ndk;28.2.13676358"
+          echo "NDK_HOME=$SDK/ndk/28.2.13676358" >> "$GITHUB_ENV"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android,i686-linux-android
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+          key: android-aarch64
+
+      - name: 安装前端依赖
+        run: pnpm install --frozen-lockfile
+
+      - name: 生成 Android 工程
+        run: pnpm tauri android init --ci
+
+      - name: 编译 APK
+        run: pnpm tauri android build --apk --target aarch64
+
+      - name: 签名 APK
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEY_BASE64 }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          STORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          VERSION: ${{ steps.ver.outputs.version }}
+          SHA7: ${{ steps.ver.outputs.sha7 }}
+        run: |
+          set -euo pipefail
+          if [ -z "${KEYSTORE_BASE64:-}" ]; then
+            echo "::error::缺少 ANDROID_KEY_BASE64，无法用固定证书签名"
+            exit 1
+          fi
+          KS="$RUNNER_TEMP/hghub.jks"
+          echo "$KEYSTORE_BASE64" | base64 -d > "$KS"
+          BT="$(ls "$ANDROID_SDK_ROOT/build-tools" | sort -V | tail -1)"
+          APKSIGNER="$ANDROID_SDK_ROOT/build-tools/$BT/apksigner"
+          mkdir -p out
+          n=0
+          for f in $(find src-tauri/gen/android/app/build/outputs/apk -name '*.apk' -type f); do
+            out="out/HGhub_${VERSION}_${SHA7}_aarch64.apk"
+            [ "$n" -eq 0 ] || out="out/HGhub_${VERSION}_${SHA7}_aarch64_${n}.apk"
+            "$APKSIGNER" sign \
+              --ks "$KS" --ks-key-alias "${KEY_ALIAS:?缺少 ANDROID_KEY_ALIAS}" \
+              --ks-pass "pass:${STORE_PASSWORD:?缺少 ANDROID_KEYSTORE_PASSWORD}" \
+              --key-pass "pass:${KEY_PASSWORD:?缺少 ANDROID_KEY_PASSWORD}" \
+              --v4-signing-enabled false \
+              --out "$out" "$f"
+            "$APKSIGNER" verify --print-certs "$out" | head -3
+            n=$((n+1))
+          done
+          [ "$n" -gt 0 ] || { echo "::error::没有找到 APK"; exit 1; }
+          rm -f "$KS"
+          ls -lh out
+          SIZE="$(du -h out/*.apk | head -1 | cut -f1)"
+          echo "SIZE=$SIZE" >> "$GITHUB_ENV"
+
+      - name: 发布 Release
+        id: rel
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.tag }}
+          name: HGhub ${{ steps.ver.outputs.version }} · 上游 ${{ steps.ver.outputs.sha7 }}
+          files: out/*.apk
+          fail_on_unmatched_files: true
+          body: |
+            自动跟进上游 `${{ env.UPSTREAM }}` 构建。
+
+            - 上游提交：`${{ needs.sync.outputs.sha }}`
+            - 客户端版本：${{ steps.ver.outputs.version }}
+            - 架构：arm64-v8a
+            - 签名：固定证书，可直接覆盖安装升级
+
+      - name: 推送到企业微信
+        if: success()
+        env:
+          WECOM: ${{ secrets.WECOM_WEBHOOK }}
+          VERSION: ${{ steps.ver.outputs.version }}
+          SHA7: ${{ steps.ver.outputs.sha7 }}
+          REL: ${{ steps.rel.outputs.url }}
+        run: |
+          set -euo pipefail
+          if [ -z "${WECOM:-}" ]; then
+            echo "未配置 WECOM_WEBHOOK，跳过通知"
+            exit 0
+          fi
+          APK_SIZE="${SIZE:-未知}"
+          CONTENT="## HGhub 新版已打包
+          > 版本：${VERSION}
+          > 上游：${SHA7}
+          > 大小：${APK_SIZE}
+          > 已用固定证书签名，可直接覆盖升级
+
+          [点此下载 APK](${REL})"
+          PAYLOAD="$(python3 -c 'import json,sys;print(json.dumps({"msgtype":"markdown","markdown":{"content":sys.argv[1]}}))' "$CONTENT")"
+          curl -sS -X POST "$WECOM" -H 'Content-Type: application/json' -d "$PAYLOAD" | head -c 300
+          echo
+
+      - name: 构建失败通知
+        if: failure()
+        env:
+          WECOM: ${{ secrets.WECOM_WEBHOOK }}
+          SHA7: ${{ steps.ver.outputs.sha7 }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          [ -n "${WECOM:-}" ] || exit 0
+          CONTENT="## HGhub 自动构建失败
+          > 上游：${SHA7}
+          > 多半是上游改了依赖或构建配置
+
+          [查看失败日志](${RUN_URL})"
+          PAYLOAD="$(python3 -c 'import json,sys;print(json.dumps({"msgtype":"markdown","markdown":{"content":sys.argv[1]}}))' "$CONTENT")"
+          curl -sS -X POST "$WECOM" -H 'Content-Type: application/json' -d "$PAYLOAD" | head -c 300
+          echo
