@@ -1,13 +1,8 @@
 name: Build Android APK
 
-# 自用出包工作流：手动触发，单 ABI 编译，自动签名。
-# 独立于上游的 release.yml，避免以后同步上游改动时冲突。
-#
-# 与上游 android job 的两处关键差异：
-#   1. 上游写的是 `--target aarch64 armv7 x86_64`，Tauri CLI 的 --target 只认
-#      逗号分隔的多值，空格分隔会被当成多余的位置参数而报错；此处改为单值。
-#   2. 上游强制要求 4 个签名 secret，缺一个就 exit 1。此处改为：有 secret 就用，
-#      没有就现场生成一张自用证书，开箱即用。
+# 手动出包：选 ABI，用仓库里固定的签名证书，出包后发 Release 并推企业微信。
+# 日常不需要手动点，auto-sync-build.yml 会在上游更新时自动跑。
+# 这里留着是为了临时出一版、或者自动流程挂掉时手动补一版。
 
 on:
   workflow_dispatch:
@@ -24,8 +19,11 @@ on:
           - i686
 
 concurrency:
-  group: android-apk-${{ github.ref }}-${{ inputs.abi }}
+  group: android-apk-manual-${{ inputs.abi }}
   cancel-in-progress: true
+
+permissions:
+  contents: write
 
 env:
   CI: "true"
@@ -42,7 +40,9 @@ jobs:
         id: ver
         run: |
           V="$(node -p "require('./src-tauri/tauri.conf.json').version")"
+          TAG="manual-$(date -u +%Y%m%d-%H%M)"
           echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "打包版本 $V，目标 ABI ${{ inputs.abi }}"
 
       - uses: pnpm/action-setup@v4
@@ -59,8 +59,6 @@ jobs:
           distribution: temurin
           java-version: "17"
 
-      # ubuntu runner 自带 Android SDK，不再调 android-actions/setup-android，
-      # 它的 license 交互会卡住。SDK 与 NDK 版本对齐上游 release.yml。
       - name: 准备 Android SDK / NDK
         run: |
           set -euo pipefail
@@ -71,7 +69,6 @@ jobs:
           yes | "$SDKM" --licenses > /dev/null 2>&1 || true
           "$SDKM" --install "platform-tools" "platforms;android-36" "build-tools;36.0.0" "ndk;28.2.13676358"
           echo "NDK_HOME=$SDK/ndk/28.2.13676358" >> "$GITHUB_ENV"
-          ls "$SDK/ndk"
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -91,7 +88,7 @@ jobs:
       - name: 编译 APK
         run: pnpm tauri android build --apk --target ${{ inputs.abi }}
 
-      - name: 签名 APK
+      - name: 用固定证书签名
         env:
           KEYSTORE_BASE64: ${{ secrets.ANDROID_KEY_BASE64 }}
           KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
@@ -101,25 +98,12 @@ jobs:
           ABI: ${{ inputs.abi }}
         run: |
           set -euo pipefail
-          KS="$RUNNER_TEMP/hghub.keystore"
-
-          # 有 secret 就复用固定证书，保证以后升级能覆盖安装；没有就现场生成一张。
-          if [ -n "${KEYSTORE_BASE64:-}" ]; then
-            echo "使用仓库 secret 中的固定证书"
-            echo "$KEYSTORE_BASE64" | base64 -d > "$KS"
-            KS_ALIAS="${KEY_ALIAS:?缺少 ANDROID_KEY_ALIAS}"
-            KS_STORE_PASS="${STORE_PASSWORD:?缺少 ANDROID_KEYSTORE_PASSWORD}"
-            KS_KEY_PASS="${KEY_PASSWORD:?缺少 ANDROID_KEY_PASSWORD}"
-          else
-            echo "未配置 secret，生成一次性自用证书"
-            KS_ALIAS="hghub"
-            KS_STORE_PASS="hghub-$(echo "$VERSION" | tr -d '.')"
-            KS_KEY_PASS="$KS_STORE_PASS"
-            keytool -genkeypair -v -keystore "$KS" -alias "$KS_ALIAS" \
-              -keyalg RSA -keysize 2048 -validity 10000 \
-              -storepass "$KS_STORE_PASS" -keypass "$KS_KEY_PASS" \
-              -dname "CN=HGhub, OU=Self, O=Self, L=Jinan, ST=Shandong, C=CN" > /dev/null 2>&1
+          if [ -z "${KEYSTORE_BASE64:-}" ]; then
+            echo "::error::缺少 ANDROID_KEY_BASE64，请先配置签名证书"
+            exit 1
           fi
+          KS="$RUNNER_TEMP/hghub.jks"
+          echo "$KEYSTORE_BASE64" | base64 -d > "$KS"
 
           BT="$(ls "$ANDROID_SDK_ROOT/build-tools" | sort -V | tail -1)"
           APKSIGNER="$ANDROID_SDK_ROOT/build-tools/$BT/apksigner"
@@ -129,24 +113,64 @@ jobs:
             out="out/HGhub_${VERSION}_${ABI}.apk"
             [ "$n" -eq 0 ] || out="out/HGhub_${VERSION}_${ABI}_${n}.apk"
             "$APKSIGNER" sign \
-              --ks "$KS" --ks-key-alias "$KS_ALIAS" \
-              --ks-pass "pass:$KS_STORE_PASS" --key-pass "pass:$KS_KEY_PASS" \
+              --ks "$KS" --ks-key-alias "${KEY_ALIAS:?缺少 ANDROID_KEY_ALIAS}" \
+              --ks-pass "pass:${STORE_PASSWORD:?缺少 ANDROID_KEYSTORE_PASSWORD}" \
+              --key-pass "pass:${KEY_PASSWORD:?缺少 ANDROID_KEY_PASSWORD}" \
               --v4-signing-enabled false \
               --out "$out" "$f"
             "$APKSIGNER" verify --print-certs "$out" | head -3
             n=$((n+1))
           done
-
-          if [ "$n" -eq 0 ]; then
-            echo "::error::没有找到编译出来的 APK"
-            find src-tauri/gen/android/app/build/outputs -type f | head -50
-            exit 1
-          fi
+          [ "$n" -gt 0 ] || { echo "::error::没有找到编译出来的 APK"; exit 1; }
+          rm -f "$KS"
           ls -lh out
+          echo "SIZE=$(du -h out/*.apk | head -1 | cut -f1)" >> "$GITHUB_ENV"
 
-      - uses: actions/upload-artifact@v4
+      - name: 发布 Release
+        id: rel
+        uses: softprops/action-gh-release@v2
         with:
-          name: HGhub-android-${{ inputs.abi }}
-          path: out/*.apk
-          if-no-files-found: error
-          retention-days: 30
+          tag_name: ${{ steps.ver.outputs.tag }}
+          name: HGhub ${{ steps.ver.outputs.version }} · 手动 · ${{ inputs.abi }}
+          files: out/*.apk
+          fail_on_unmatched_files: true
+          body: |
+            手动触发构建。
+
+            - 客户端版本：${{ steps.ver.outputs.version }}
+            - 架构：${{ inputs.abi }}
+            - 签名：固定证书，可覆盖升级
+
+      - name: 推送到企业微信
+        if: success()
+        env:
+          WECOM: ${{ secrets.WECOM_WEBHOOK }}
+          VERSION: ${{ steps.ver.outputs.version }}
+          ABI: ${{ inputs.abi }}
+          REL: ${{ steps.rel.outputs.url }}
+        run: |
+          set -euo pipefail
+          [ -n "${WECOM:-}" ] || { echo "未配置 WECOM_WEBHOOK，跳过"; exit 0; }
+          CONTENT="## HGhub 手动出包完成
+          > 版本：${VERSION}（${ABI}）
+          > 大小：${SIZE:-未知}
+          > 固定证书签名，可覆盖升级
+
+          [点此下载 APK](${REL})"
+          PAYLOAD="$(python3 -c 'import json,sys;print(json.dumps({"msgtype":"markdown","markdown":{"content":sys.argv[1]}}))' "$CONTENT")"
+          curl -sS -X POST "$WECOM" -H 'Content-Type: application/json' -d "$PAYLOAD" | head -c 300
+          echo
+
+      - name: 构建失败通知
+        if: failure()
+        env:
+          WECOM: ${{ secrets.WECOM_WEBHOOK }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          [ -n "${WECOM:-}" ] || exit 0
+          CONTENT="## HGhub 手动构建失败
+          [查看日志](${RUN_URL})"
+          PAYLOAD="$(python3 -c 'import json,sys;print(json.dumps({"msgtype":"markdown","markdown":{"content":sys.argv[1]}}))' "$CONTENT")"
+          curl -sS -X POST "$WECOM" -H 'Content-Type: application/json' -d "$PAYLOAD" | head -c 300
+          echo
