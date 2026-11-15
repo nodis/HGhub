@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { fmtTime } from "../api";
+import { fmtTime } from "../format";
 import { useSeekInput } from "../useSeekInput";
 import { ICheck, ICompress, IExpand, ILockF, INext, IPauseF, IPip, IPlayF, ITheater, IVol, IVolMute } from "../icons";
 
