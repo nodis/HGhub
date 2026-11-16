@@ -4,9 +4,9 @@
   "version": "0.0.1",
   "identifier": "com.hghub.player",
   "build": {
-    "beforeDevCommand": "pnpm dev",
+    "beforeDevCommand": "node scripts/sync-android-network.mjs && pnpm dev",
     "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "pnpm build && node scripts/sync-android-icons.mjs",
+    "beforeBuildCommand": "pnpm build && node scripts/sync-android-icons.mjs && node scripts/sync-android-network.mjs",
     "frontendDist": "../dist"
   },
   "app": {

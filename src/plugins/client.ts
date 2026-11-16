@@ -36,6 +36,7 @@ export async function pluginCommand<T>(action: string, params: Record<string, un
     if (["updates.check", "updates.policy.set", "updates.install", "updates.dismiss", "subscriptions.save", "subscriptions.remove"].includes(action)) window.dispatchEvent(new Event("hpp.updates.changed"));
     if (["import", "enable", "retry", "remove", "restore", "distribution.apply", "settings.set", "endpoint.set", "endpoint.list"].includes(action)) window.dispatchEvent(new Event("hpp.changed"));
     const isAuth = action === "form.submit" && (params.target as { kind?: string })?.kind === "auth" || action === "call" && params.method === "auth.submit";
+    if (action === 'call' && params.method === 'auth.logout') window.dispatchEvent(new Event('hpp.changed'));
     if (isAuth && typeof params.id === "string" && (result as { status?: string })?.status === "ok") {
       for (const listener of authSuccessListeners) listener(params.id);
     }

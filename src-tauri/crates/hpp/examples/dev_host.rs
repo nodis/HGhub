@@ -9,6 +9,10 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
     let root = PathBuf::from(args.next().ok_or("expected plugin data directory")?);
+    std::fs::create_dir_all(&root)?;
+    hghub_hpp::proxy::bind(&root);
+    std::fs::create_dir_all(&root)?;
+    hghub_hpp::proxy::bind(&root);
     let relaxed = args.any(|a| a == "--relaxed");
     let manager = Arc::new(PluginManager::with_mode(
         root,

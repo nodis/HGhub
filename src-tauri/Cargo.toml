@@ -46,6 +46,10 @@ objc2-app-kit = { version = "0.3", default-features = false, features = [
 ] }
 objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSGeometry"] }
 
+# Avoid invalid incremental object references on filesystems without hard links.
+[profile.dev]
+incremental = false
+
 [profile.release]
 panic = "abort"
 codegen-units = 1

@@ -1,6 +1,24 @@
 use serde_json::{json, Value};
 use tauri::Manager;
 use tauri_plugin_opener::OpenerExt;
+
+#[cfg(target_os = "android")]
+pub struct OrientationPlugin(pub tauri::plugin::PluginHandle<tauri::Wry>);
+
+#[cfg(target_os = "android")]
+#[tauri::command]
+pub async fn set_orientation(landscape: bool, plugin: tauri::State<'_, OrientationPlugin>) -> Result<(), String> {
+    plugin.0.run_mobile_plugin_async::<()>("setOrientation", serde_json::json!({"landscape": landscape})).await
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(not(target_os = "android"))]
+#[tauri::command]
+pub fn set_orientation(landscape: bool) -> Result<(), String> {
+    let _ = landscape;
+    Err("当前平台不支持原生屏幕方向切换".into())
+}
+
 #[tauri::command]
 pub fn app_boot() -> Value {
     json!({"strict_security":crate::network_policy::strict_security()})

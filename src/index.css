@@ -496,19 +496,6 @@ input[type="range"].hg-range::-webkit-slider-thumb { -webkit-appearance: none; w
   overflow: hidden;
 }
 
-/* —— 移动端沉浸全屏（系统仍处于竖屏时的 CSS 90° 旋转兜底） —— */
-.fs-landscape {
-  position: fixed;
-  top: 50%; left: 50%; right: auto; bottom: auto;
-  width: 100vh; height: 100vw;
-  width: 100dvh; height: 100dvw;
-  transform: translate(-50%, -50%) rotate(90deg);
-  transform-origin: center center;
-  z-index: 45;
-  background: #000;
-  overflow: hidden;
-}
-
 .desktop-dock-panel {
   position: absolute; top: 0; right: 0; bottom: 0; width: 0; z-index: 40;
   background: var(--p-s1); overflow: hidden;

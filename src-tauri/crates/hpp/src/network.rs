@@ -258,14 +258,8 @@ impl Network {
                 .connect_timeout(Duration::from_secs(10))
                 .user_agent("HGhub/HPP-dev")
                 .resolve_to_addrs(&host, &addrs);
-            if let Ok(proxy) = std::env::var("HGHUB_PROXY") {
-                if !proxy.trim().is_empty() {
-                    builder = builder.proxy(
-                        reqwest::Proxy::all(proxy)
-                            .map_err(|_| PluginError::new("NETWORK", "代理配置无效"))?,
-                    );
-                }
-            }
+            builder = crate::proxy::configure(builder, &crate::proxy::snapshot())
+                .map_err(|e| PluginError::new("NETWORK", e))?;
             let client = builder
                 .build()
                 .map_err(|_| PluginError::new("NETWORK", "无法创建 HTTP 客户端"))?;
@@ -301,7 +295,7 @@ impl Network {
             if let Some(b) = &body {
                 req = req.body(b.clone());
             }
-            let resp = tokio::select! {_=cancel.cancelled()=>return Err(PluginError::cancelled()),v=req.send()=>v.map_err(|_|PluginError::new("NETWORK","HTTP 连接失败"))?};
+            let resp = tokio::select! {_=cancel.cancelled()=>return Err(PluginError::cancelled()),v=req.send()=>v.map_err(|e|PluginError::new("NETWORK",crate::proxy::connection_error(&e)))?};
             if cookies {
                 self.receive_cookies(&target, resp.headers())?;
             }
@@ -371,7 +365,7 @@ impl Network {
                     .collect::<std::collections::BTreeMap<_, _>>()),
             );
         }
-        let key = key.to_string();
+        let key = format!("{}:{}", crate::proxy::generation(), key);
         let mut old = None;
         if eligible {
             if let Some(entry) = self.cache.lock().unwrap().get(&key) {

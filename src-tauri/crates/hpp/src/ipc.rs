@@ -29,6 +29,9 @@ pub async fn dispatch(
         return manager.library.operation(action, p);
     }
     let value = match action.as_str() {
+        "proxy.get" => crate::proxy::get(),
+        "proxy.set" => crate::proxy::set(text(p, "mode")?, p["url"].as_str().unwrap_or("")).map_err(PluginError::invalid)?,
+        "proxy.test" => crate::proxy::probe(text(p, "mode")?, p["url"].as_str().unwrap_or(""), text(p, "target")?).await.map_err(PluginError::invalid)?,
         "list" => json!(manager.list().await),
         "updates.state" => json!(manager.refresh_update_state().await?),
         "updates.policy.set" => json!(manager.update_policy_set(

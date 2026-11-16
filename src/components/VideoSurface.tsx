@@ -53,7 +53,7 @@ export default forwardRef<VideoHandle, Props>(function VideoSurface(props, forwa
   useEffect(()=>{if(!props.active)ref.current?.pause();},[props.active]);
   const dimensions=()=>{const v=ref.current!;if(Number.isFinite(v.duration))latest.current.onDuration(v.duration);if(v.videoWidth)latest.current.onSize(v.videoWidth,v.videoHeight);};
   return <div className="absolute inset-0 overflow-hidden" onClick={props.onClick}>
-    <video ref={ref} playsInline autoPlay={props.autoPlay} crossOrigin="anonymous" poster={props.poster} className="w-full h-full"
+    <video ref={ref} playsInline autoPlay={props.autoPlay && props.active} crossOrigin="anonymous" poster={props.poster} className="w-full h-full"
       style={{objectFit:props.fit,transform:`translate(${props.panX}px, ${props.panY}px) scale(${props.scale})`,transition:props.isGesturing?"none":"transform .18s ease"}}
       onLoadedMetadata={dimensions} onLoadedData={dimensions} onTimeUpdate={e=>props.onTime(e.currentTarget.currentTime)}
       onProgress={e=>{const v=e.currentTarget;props.onBuffered(v.duration&&v.buffered.length?v.buffered.end(v.buffered.length-1)/v.duration:0);}}

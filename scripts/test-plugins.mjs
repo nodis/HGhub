@@ -16,6 +16,7 @@ import { testPluginFeed } from "./test-plugin-feed.mjs";
 import { testPluginSourceSwitch } from "./test-plugin-source-switch.mjs";
 import { testPluginBrowsing } from "./test-plugin-browsing.mjs";
 import { testResolverPreferences } from "./test-plugin-resolver-preferences.mjs";
+import { testWatchExperience } from "./test-watch-experience.mjs";
 import { testFrontend } from "./test-frontend.mjs";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -87,9 +88,11 @@ try {
   const errors = []; page.on("pageerror", e => errors.push(e.message));
   await page.route("**/__hpp_test_ipc", async route => { const response = await dispatch(JSON.parse(route.request().postData())); await route.fulfill({ contentType: "application/json", body: JSON.stringify(response) }); });
   await page.route("**/*", route => { const url = route.request().url(); if (url.includes("/__hpp_test_ipc") || new URL(url).hostname === "127.0.0.1") return route.fallback(); report.external.push(url); return route.abort(); });
-  if (!process.argv.includes("--frontend")) await page.addInitScript(() => { if (!localStorage.getItem("hpp.preferences")) localStorage.setItem("hpp.preferences", JSON.stringify({ homeMode: "multiple", homeIds: [], autoNext: false })); });
+  if (!process.argv.includes("--frontend") && !process.argv.includes("--experience")) await page.addInitScript(() => { if (!localStorage.getItem("hpp.preferences")) localStorage.setItem("hpp.preferences", JSON.stringify({ homeMode: "multiple", homeIds: [], autoNext: false })); });
   await page.goto(`${ui}tests/plugins.html`);
-  if (process.argv.includes("--frontend")) {
+  if (process.argv.includes("--experience")) {
+    await testWatchExperience({ page, browser, dispatch, base, ui, root, output, report });
+  } else if (process.argv.includes("--frontend")) {
     await testFrontend({ page, browser, dispatch, base, ui, root, output, report });
   } else if (process.argv.includes("--browsing")) {
     await testPluginBrowsing({ page, dispatch, root, output, report, rail: page.getByRole("navigation", {name:"主导航"}) });

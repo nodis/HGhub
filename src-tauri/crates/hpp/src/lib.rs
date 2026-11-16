@@ -9,6 +9,7 @@ pub mod media;
 pub mod model;
 mod native;
 mod network;
+pub mod proxy;
 pub mod network_policy;
 mod resolver_preferences;
 mod runtime;
