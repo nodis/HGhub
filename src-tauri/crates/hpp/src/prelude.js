@@ -147,15 +147,15 @@
       return current || "";
     },
     async install(factory, config){
-      const {meta,settings,endpoint}=JSON.parse(config), log={};
+      const {meta,settings,endpoint,media}=JSON.parse(config), log={};
       for(const level of ["debug","info","warn","error"])log[level]=(...args)=>sync("log",{level,text:args.map(v=>v instanceof Uint8Array?`Uint8Array(${v.length})`:typeof v==="string"?v:(()=>{try{return JSON.stringify(v);}catch{return String(v);}})()).join(" ")});
       const codec={
         base64Encode:(data,options={})=>sync("codec.base64Encode",{data,...options}),base64Decode:text=>sync("codec.base64Decode",{text}),
         hexEncode:data=>sync("codec.hexEncode",{data}),hexDecode:text=>sync("codec.hexDecode",{text}),
         utf8Encode:text=>sync("codec.utf8Encode",{text}),utf8Decode:data=>sync("codec.decodeText",{data,charset:"utf-8"}),decodeText:(data,charset)=>sync("codec.decodeText",{data,charset})
       };
-      const crypto={digest:(algorithm,data)=>sync("crypto.digest",{algorithm,data}),hmac:(algorithm,key,data)=>sync("crypto.hmac",{algorithm,key,data}),aesEncrypt:(params,data)=>sync("crypto.aesEncrypt",{...params,data}),aesDecrypt:(params,data)=>sync("crypto.aesDecrypt",{...params,data}),randomBytes:length=>sync("crypto.randomBytes",{length}),randomUUID:()=>sync("crypto.randomUUID",{})};
-      const hg={PluginError,env:deepFreeze(configEnv(meta)),endpoint:Object.freeze({current:deepFreeze(endpoint),url(path){if(!endpoint)throw new PluginError("UNSUPPORTED","当前尚无站点线路");const u=new URL(path,endpoint.url);if(!path.startsWith("/")||path.startsWith("//")||u.origin!==endpoint.url)throw new PluginError("INVALID_ARGUMENT","路径必须位于当前 origin");return u.href;}}),settings:Object.freeze({get:key=>Object.hasOwn(settings,key)?structuredClone(settings[key]):undefined,getAll:()=>structuredClone(settings)}),log,codec,crypto,
+      const crypto={digest:(algorithm,data)=>sync("crypto.digest",{algorithm,data}),hmac:(algorithm,key,data)=>sync("crypto.hmac",{algorithm,key,data}),aesEncrypt:(params,data)=>sync("crypto.aesEncrypt",{...params,data}),aesDecrypt:(params,data)=>sync("crypto.aesDecrypt",{...params,data}),rsaEncrypt:(params,data)=>sync("crypto.rsaEncrypt",{...params,data}),randomBytes:length=>sync("crypto.randomBytes",{length}),randomUUID:()=>sync("crypto.randomUUID",{})};
+      const hg={PluginError,env:deepFreeze(configEnv(meta,media)),endpoint:Object.freeze({current:deepFreeze(endpoint),url(path){if(!endpoint)throw new PluginError("UNSUPPORTED","当前尚无站点线路");const u=new URL(path,endpoint.url);if(!path.startsWith("/")||path.startsWith("//")||u.origin!==endpoint.url)throw new PluginError("INVALID_ARGUMENT","路径必须位于当前 origin");return u.href;}}),settings:Object.freeze({get:key=>Object.hasOwn(settings,key)?structuredClone(settings[key]):undefined,getAll:()=>structuredClone(settings)}),log,codec,crypto,
         http:{fetch(req){const{signal,...params}=req;return host("http",params,signal);}},
         cookies:Object.fromEntries(["get","set","clear"].map(op=>[op,params=>host("cookies."+op,params||{})])),
         storage:{async get(key){const r=await host("storage.get",{key});return r.found?r.value:undefined;},set:(key,value,options={})=>host("storage.set",{key,value,...options}),delete:key=>host("storage.delete",{key}),keys:(prefix="")=>host("storage.keys",{prefix}),clear:()=>host("storage.clear",{})},
@@ -195,7 +195,7 @@
     cancel(id){const s=scopes.get(id);if(s){s.controller.abort();clean(id);}},
     pack,unpack
   };
-  function configEnv(meta){return {protocol:"1.0.0-dev",app:{name:"HGhub",version:"0.0.1"},plugin:{id:meta.id,version:meta.version},platform:sync("env",{}).platform,locale:"zh-CN",features:["charset.legacy"],media:{codecs:["h264"],formats:["hls","progressive"]}};}
+  function configEnv(meta,media){return {protocol:"1.0.0-dev",app:{name:"HGhub",version:"0.0.1"},plugin:{id:meta.id,version:meta.version},platform:sync("env",{}).platform,locale:"zh-CN",features:["charset.legacy"],media};}
   function structuredClone(v){return unpack(pack(v));}
   Object.assign(globalThis,{AbortSignal,AbortController,TextEncoder,TextDecoder,URL,URLSearchParams,setTimeout,clearTimeout,structuredClone,
     queueMicrotask:fn=>Promise.resolve().then(fn),

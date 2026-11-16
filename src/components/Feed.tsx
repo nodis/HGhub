@@ -27,13 +27,14 @@ export interface FeedPresentation {
   previousPreview?: { title: string; poster?: string }; nextPreview?: { title: string; poster?: string };
 }
 export interface FeedProps extends FeedPresentation {
-  media: PreparedMedia | null; position: number; active?: boolean; error?: string; onRetry?: () => void;
+  media: PreparedMedia | null; position: number; active?: boolean; preparing?: boolean; error?: string; onRetry?: () => void;
   onPosition: (t: number, duration?: number) => void; onFailure: () => void;
   onPlaying?: () => void; onStopped?: () => void; onEnded?: () => void;
+  onBuffer?: (seconds: number) => void; onWaiting?: () => void;
 }
 /** Restored from 5f88442 Feed: shared desktop chrome and mobile gestures.
  * Plugin adapters own metadata, sessions and persistence; this component owns presentation. */
-export default function Feed({media, position, active=true, error="", onRetry, onPosition, onFailure, onPlaying, onStopped, onEnded,
+export default function Feed({media, position, active=true, preparing=false, error="", onRetry, onPosition, onFailure, onPlaying, onStopped, onEnded, onBuffer, onWaiting,
  title="", author="", description="", score, poster:posterUrl, episodeLabel="", qualityLabel, episodeCount=0, favorite=false, onFavorite,
  playIntent=0, mode="full", onOpenDetail, panels={}, social, onPanelChange, onBack, onNext, onPrevious, onNextEpisode, onPreviousEpisode, queueIndex=0, total=1, previousPreview, nextPreview}: FeedProps) {
   const store=useStore(), {muted,setMuted,volume,setVolume}=store;
@@ -51,10 +52,12 @@ export default function Feed({media, position, active=true, error="", onRetry, o
   const [duration, setDuration] = useState(0);
   const [vsize, setVsize] = useState({ w: 0, h: 0 });
   const [buffered, setBuffered] = useState(0);
-  const [paused, setPaused] = useState(false);
+  const [playback, setPlayback] = useState<{ key: string; phase: 'loading' | 'playing' | 'paused' }>({ key: playKey, phase: 'loading' });
+  const phase = preparing || playback.key !== playKey ? 'loading' : playback.phase;
+  const paused = phase === 'paused', waiting = phase === 'loading';
+  const setPhase = (phase: typeof playback.phase) => setPlayback({ key: playKey, phase });
   const [controlsLocked, setControlsLocked] = useState(false);
   const [rate, setRate] = useState(1);
-  const [waiting, setWaiting] = useState(false);
   const [err, setErr] = useState("");
   /* 取播放地址失败后手动重试：递增即重新触发拉取 */
   const [panel, setPanel] = useState<SurfacePanel | null>(null);
@@ -207,7 +210,7 @@ export default function Feed({media, position, active=true, error="", onRetry, o
   const go=(delta:number)=>{ if(!active || controlsLocked || panel) return; if(preview) delta>0 ? onNext?.() : onPrevious?.(); else delta>0 ? onNextEpisode?.() : onPreviousEpisode?.(); };
   const onTimeTick=(t:number)=>{ if(!barScrub.current && gesture.current?.mode!=="scrub")setTime(t); onPosition(t,videoRef.current?.el()?.duration); };
   const onDurationTick=(d:number)=>setDuration(d);
-  useEffect(()=>{setTime(position);setDuration(0);setWaiting(!!media);setErr("");setZoom({scale:1,x:0,y:0,gesturing:false});},[playKey]);
+  useEffect(()=>{setTime(position);setDuration(0);setErr("");setZoom({scale:1,x:0,y:0,gesturing:false});},[playKey]);
   useEffect(()=>()=>{clearTapTimer();if(activeRef.current){store.setClean(false);store.setFs(false);}},[]);
   useEffect(()=>{videoRef.current?.rate(effRate);},[effRate,playKey]);
   useEffect(()=>{if(!panel || !active)return;return registerBackHandler(()=>{setPanel(null);return true;},10);},[panel,active]);
@@ -563,7 +566,7 @@ export default function Feed({media, position, active=true, error="", onRetry, o
           const isActive = true;
           return (
             <section
-              key={vid}
+              key="surface"
               style={!isActive && fs ? { display: "none" } : undefined}
               className={`relative w-full h-full snap-start snap-always ${fs && isActive ? "" : "overflow-hidden"}`}>
               {isActive && playUrl ? (
@@ -590,10 +593,11 @@ export default function Feed({media, position, active=true, error="", onRetry, o
                       onTime={onTimeTick}
                       onDuration={onDurationTick}
                       onSize={(w, h) => setVsize({ w, h })}
-                      onPlaying={() => { setPaused(false); setWaiting(false); setErr(""); onPlaying?.(); }}
-                      onPause={() => { setPaused(true); onStopped?.(); }}
-                      onWaiting={() => setWaiting(true)}
+                      onPlaying={() => { setPhase('playing'); setErr(""); onPlaying?.(); }}
+                      onPause={() => { setPhase('paused'); onStopped?.(); }}
+                      onWaiting={() => { setPhase('loading'); onWaiting?.(); }}
                       onEnded={onEnded} onBuffered={setBuffered}
+                      onBuffer={onBuffer}
                       onError={() => { setErr("播放失败"); onFailure(); }}
                     />
                   </div>
@@ -619,7 +623,7 @@ export default function Feed({media, position, active=true, error="", onRetry, o
                     </div>
                   )}
                   {waiting && !err && !paused && (
-                    <div className="absolute inset-0 z-10 flex items-center justify-center pointer-events-none"><div className="w-9 h-9 spinner" /></div>
+                    <div role="status" aria-label="正在加载视频" className="absolute inset-0 z-10 flex items-center justify-center pointer-events-none"><div className="w-9 h-9 spinner" /></div>
                   )}
                   {err && (
                     <div className="absolute inset-0 z-30 flex items-center justify-center pointer-events-none">
@@ -730,7 +734,7 @@ export default function Feed({media, position, active=true, error="", onRetry, o
                     <span>视频暂时无法加载</span>
                     <span className="text-[10.5px] hg-ink-4 max-w-[240px] text-center break-all">{error || err}</span>
                     <button className="px-4 py-1.5 rounded-full hg-chip-strong hg-link text-[12.5px] font-semibold pressable"
-                      onClick={() => { setErr(""); setWaiting(true); onRetry?.(); }}>
+                      onClick={() => { setErr(""); setPhase('loading'); onRetry?.(); }}>
                       重新加载
                     </button>
                   </div>

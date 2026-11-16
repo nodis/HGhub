@@ -1,5 +1,6 @@
 //! HGhub Plugin Protocol host. No content providers or upstream-specific code.
 mod content;
+pub mod capabilities;
 pub mod error;
 mod forms;
 pub mod ipc;

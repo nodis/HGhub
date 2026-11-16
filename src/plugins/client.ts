@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { probeMediaCapabilities } from "./mediaCapabilities";
 import type { PlaybackInfo, PlaybackServer, PluginFailure, PluginMeta, Codec, MediaFormat } from "./protocol";
 
 export interface InstalledPlugin {
@@ -7,6 +8,7 @@ export interface InstalledPlugin {
   origin?: { kind: string; location: string; manifest?: string; manifestName?: string }; canRestore?: boolean;
 }
 export interface PreparedMedia {
+  requestedAt?: number;
   sessionId: string; url: string; format: "hls" | "progressive"; providerId: string;
   playback: Omit<PlaybackInfo, "streams">;
   choices: { source: PlaybackChoices; resolver?: PlaybackChoices; resolverRoute?: ResolverRoute };
@@ -21,6 +23,14 @@ export interface PlaybackChoices {
 export type AuthFailure = { id: string; code: "AUTH_REQUIRED" | "AUTH_EXPIRED"; message: string; silent?: boolean };
 const authListeners = new Set<(failure: AuthFailure) => void>();
 const authSuccessListeners = new Set<(id: string) => void>();
+let mediaReady: Promise<unknown> | undefined;
+function ensureMediaCapabilities() {
+  // All first-use requests share registration; retry a failed IPC on the next action.
+  return mediaReady ??= invoke("hpp_manage", { action: "host.media.configure", params: probeMediaCapabilities() }).catch(error => {
+    mediaReady = undefined;
+    throw error;
+  });
+}
 export function onPluginAuthFailure(listener: (failure: AuthFailure) => void) {
   authListeners.add(listener);
   return () => { authListeners.delete(listener); };
@@ -31,6 +41,7 @@ export function onPluginAuthSuccess(listener: (id: string) => void) {
 }
 export async function pluginCommand<T>(action: string, params: Record<string, unknown> = {}, options: { notifyAuth?: boolean } = {}): Promise<T> {
   try {
+    await ensureMediaCapabilities();
     const result = await invoke<T>("hpp_manage", { action, params });
     if (["updates.startup", "updates.tick", "updates.install"].includes(action) && (result as { changed?: boolean })?.changed) window.dispatchEvent(new Event("hpp.changed"));
     if (["updates.check", "updates.policy.set", "updates.install", "updates.dismiss", "subscriptions.save", "subscriptions.remove"].includes(action)) window.dispatchEvent(new Event("hpp.updates.changed"));

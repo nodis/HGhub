@@ -12,6 +12,12 @@
 | 页面流不能播 | 匹配解析器、页面是否误标为 MP4 |
 | Android 列表失败 | content URI 相对条目限制 |
 
+## 播放能力测试
+
+`hg.env.media` 是实际播放前端注册的加载快照。单独运行 Rust/stdio 宿主时默认 codecs/formats 均为空；使用 stdio 适配器的测试可先调用宿主动作 `host.media.configure`，参数例如 `{ "codecs": ["h264"], "formats": ["hls", "progressive"] }`。这是宿主测试接口，不是插件可调用的 hg API。内存假宿主通过 `createMockHost({ env: { media: ... } })` 显式注入测试能力，不能据此声称设备支持。
+
+`node scripts/test-media-capabilities.mjs` 检查路径选择、API 返回值、编码交集、启动注册等待及失败重试；Rust `tests/media_capabilities.rs` 检查真实 QuickJS 快照、点播/直播/解析器参数、重复注册与能力变化。它们不进行视频样本解码或 UI 验收。
+
 ## 仓库验证
 
 ```powershell

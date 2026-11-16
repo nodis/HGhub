@@ -145,6 +145,11 @@ interface HostEnv {
 
 - 全部为插件加载时的快照。界面语言等变化后，宿主重载插件。
 - 插件**应当**用 `features` 与 `media` 做能力探测，而不是根据 `platform` 或 `app.version` 推断。
+- 媒体能力以当前播放路径的能力 API 探测为依据；编码名是编码家族，不保证该家族所有 profile、
+  分辨率、码率或音视频组合均能播放，也不等同于实际样本解码验收。未探测或没有可靠支持结果时允许空列表，
+  不得默认宣称 H.264 或按操作系统名称猜测。HGhub 当前探测方式与保守范围见 [实现说明](IMPLEMENTATION.md#播放能力探测2026-11-16)。
+- 点播、直播及解析器收到的 `params.codecs` 必须与该插件加载快照的 `hg.env.media.codecs` 一致，
+  包括正常播放、预加载和刷新。宿主探测结果变化时重建运行时，不能原地修改已有只读快照。
 - 需要"设备号"的上游，请自行生成随机值并存入 `hg.storage`。
 
 ### 3.1 可选特性
@@ -253,7 +258,13 @@ interface RsaParams {
 ```
 
 - GCM 的 16 字节认证标签附在密文末尾；校验失败抛 `INVALID_ARGUMENT`。
-- `rsaEncrypt` 只做公钥加密（部分上游要求用公钥加密登录密码）。
+- `rsaEncrypt` 只做公钥加密（部分上游要求用公钥加密登录密码）。公钥模数为 1024–8192 位；
+  PEM 标签为 `PUBLIC KEY`（SPKI）或 `RSA PUBLIC KEY`（PKCS#1），不接受私钥。
+- RSA 的 `pkcs1` 表示 RSAES-PKCS1-v1_5；OAEP 使用所选摘要及相同摘要的 MGF1，label 为空。
+  由系统安全随机源提供填充随机性，返回长度为模数字节数的密文，不自动分块。
+- 设模数字节数为 k，RSA 单次明文上限：`pkcs1` 为 k−11，`oaep-sha1` 为 k−42，
+  `oaep-sha256` 为 k−66。`data` 必须是 `Uint8Array`；文本先 UTF-8 编码，再按字节计算长度。
+  无效 PEM/公钥、填充、类型或超长明文抛 `INVALID_ARGUMENT`；随机源失败抛 `INTERNAL`。
 - 上表之外的算法由插件自行打包纯 JS 实现。
 
 ## 8. `hg.codec`

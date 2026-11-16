@@ -40,6 +40,7 @@ pub struct Network {
     gate: tokio::sync::Semaphore,
     rate: Mutex<(f64, Instant)>,
     cache: Mutex<HashMap<String, CachedResponse>>,
+    clients: tokio::sync::Mutex<HashMap<String, (Instant, reqwest::Client)>>,
     pub cooldown: Arc<Mutex<HashMap<String, Instant>>>,
 }
 struct CachedResponse {
@@ -69,6 +70,7 @@ impl Network {
             gate: tokio::sync::Semaphore::new(6),
             rate: Mutex::new((15.0, Instant::now())),
             cache: Mutex::new(HashMap::new()),
+            clients: Default::default(),
             cooldown,
         })
     }
@@ -226,6 +228,52 @@ impl Network {
             tokio::select! {_=cancel.cancelled()=>return Err(PluginError::cancelled()),_=tokio::time::sleep(Duration::from_millis(50))=>{}}
         }
     }
+    // A pool is bound to validated DNS answers and the effective network policy.
+    // Revalidate periodically; never reuse a pool across proxy/security changes.
+    async fn client(&self, target: &Url, cancel: &CancellationToken) -> Result<reqwest::Client> {
+        let strict = self.strict();
+        let key = format!(
+            "{}:{}:{}",
+            crate::proxy::generation(),
+            strict,
+            target.origin().ascii_serialization()
+        );
+        let mut pools = tokio::select! {
+            _ = cancel.cancelled() => return Err(PluginError::cancelled()),
+            guard = self.clients.lock() => guard,
+        };
+        pools.retain(|_, (created, _)| created.elapsed() < Duration::from_secs(60));
+        if let Some((_, client)) = pools.get(&key) {
+            return Ok(client.clone());
+        }
+        let addrs = tokio::select! {
+            _ = cancel.cancelled() => return Err(PluginError::cancelled()),
+            value = network_policy::resolve_target(target, strict) => value.map_err(|e| PluginError::new("NETWORK", e))?,
+        };
+        let builder = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .referer(false)
+            .connect_timeout(Duration::from_secs(10))
+            .pool_idle_timeout(Duration::from_secs(45))
+            .pool_max_idle_per_host(6)
+            .user_agent("HGhub/HPP-dev")
+            .resolve_to_addrs(target.host_str().unwrap(), &addrs);
+        let client = crate::proxy::configure(builder, &crate::proxy::snapshot())
+            .map_err(|e| PluginError::new("NETWORK", e))?
+            .build()
+            .map_err(|_| PluginError::new("NETWORK", "无法创建 HTTP 客户端"))?;
+        if pools.len() >= 32 {
+            if let Some(oldest) = pools
+                .iter()
+                .min_by_key(|(_, (at, _))| *at)
+                .map(|(key, _)| key.clone())
+            {
+                pools.remove(&oldest);
+            }
+        }
+        pools.insert(key, (Instant::now(), client.clone()));
+        Ok(client)
+    }
     pub async fn request(
         &self,
         raw: &str,
@@ -251,18 +299,7 @@ impl Network {
                     return Err(e);
                 }
             }
-            let addrs = tokio::select! {_=cancel.cancelled()=>return Err(PluginError::cancelled()),v=network_policy::resolve_target(&target,self.strict())=>v.map_err(|e|PluginError::new("NETWORK",e))?};
-            let mut builder = reqwest::Client::builder()
-                .redirect(reqwest::redirect::Policy::none())
-                .referer(false)
-                .connect_timeout(Duration::from_secs(10))
-                .user_agent("HGhub/HPP-dev")
-                .resolve_to_addrs(&host, &addrs);
-            builder = crate::proxy::configure(builder, &crate::proxy::snapshot())
-                .map_err(|e| PluginError::new("NETWORK", e))?;
-            let client = builder
-                .build()
-                .map_err(|_| PluginError::new("NETWORK", "无法创建 HTTP 客户端"))?;
+            let client = self.client(&target, cancel).await?;
             if target.origin() != initial {
                 explicit.remove("authorization");
                 explicit.remove("cookie");

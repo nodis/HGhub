@@ -1,6 +1,6 @@
 [package]
 name = "huangguo-client"
-version = "0.0.1"
+version = "0.0.2"
 description = "HGhub · 插件视频播放器"
 authors = ["HGhub"]
 license = "PolyForm-Noncommercial-1.0.0"

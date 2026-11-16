@@ -36,8 +36,6 @@ Thumbs.db
 # API
 docs/API.md
 
-# Agent instructions (local)
-AGENTS.md
 
 # Private development baseline; never bundled or published with the client.
 /local-plugins/

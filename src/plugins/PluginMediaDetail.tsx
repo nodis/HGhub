@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useHost, libraryKey, type LocalProgress } from "./HostContext";
-import { pluginCommand, pluginError, releaseMedia, type InstalledPlugin, type PreparedMedia, type PlaybackChoices } from "./client";
+import { pluginCommand, pluginError, releaseMedia, onPluginAuthSuccess, onPluginAuthFailure, type InstalledPlugin, type PreparedMedia, type PlaybackChoices } from "./client";
+import { NextEpisode } from './nextEpisode';
+import { playbackTiming } from './playbackTiming';
 import { initialPlaybackSelection, rememberPlaybackSelection, type PlaybackSelection } from "./playbackSelection";
 import { usePluginRequests } from "./usePluginRequests";
 import PluginPlayer from "./PluginPlayer";
@@ -66,6 +68,33 @@ export default function PluginMediaDetail({ plugin, mediaId, onBack, manage, act
   const detailRef = useRef<MediaItem | null>(detail || entryItem || null), latestHost = useRef(host); detailRef.current = detail || entryItem || null; latestHost.current = host;
   const session = useRef<PreparedMedia | null>(null), lastSave = useRef(0);
   const failedWhileHidden = useRef(false);
+  const transitioning = useRef(false), bufferAhead = useRef(0), playing = useRef(false);
+  const durationRef = useRef(0), pagePending = useRef('');
+  const prefetch = useMemo(() => new NextEpisode({
+    prepare: (params, requestId) => pluginCommand<PreparedMedia>('media.prepare', { ...params, requestId }, { notifyAuth: false }),
+    cancel: requestId => { void pluginCommand('cancel', { requestId }).catch(() => {}); },
+    release: releaseMedia,
+    warm: async (media, params, signal) => {
+      if (!viewActive.current || !playing.current || document.hidden || signal.aborted) return false;
+      const args = params.args as { playlistId?: string; episodeId: string };
+      const saved = await pluginCommand<LocalProgress | null>('library.progress.get', { pluginId: plugin.meta.id, mediaId, playlistId: args.playlistId, episodeId: args.episodeId });
+      if (!viewActive.current || !playing.current || document.hidden || signal.aborted) return false;
+      const result = await pluginCommand<{ bytes: number }>('media.preload', { sessionId: media.sessionId, positionSec: saved?.positionSec || 0 });
+      return result.bytes > 0;
+    },
+    stopWarm: sessionId => { void pluginCommand('media.preload.cancel', { sessionId }).catch(() => {}); },
+    activate: sessionId => pluginCommand('media.activity', { sessionId, playing: true }),
+  }), [plugin.meta.id, plugin.revision, mediaId]);
+  const environmentKey = JSON.stringify(host.plugins.map(p => [p.meta.id, p.revision, p.enabled, p.endpoint?.url]));
+  const preparationKey = (ep: Episode, listId: string | undefined, chosen: PlaybackSelection) => JSON.stringify([environmentKey, mediaId, listId, ep.id, chosen]);
+  useEffect(() => {
+    const clear = () => prefetch.clear();
+    const hidden = () => { if (document.hidden) clear(); };
+    const success = onPluginAuthSuccess(clear), failure = onPluginAuthFailure(clear);
+    window.addEventListener('hpp.changed', clear); document.addEventListener('visibilitychange', hidden);
+    return () => { clear(); success(); failure(); window.removeEventListener('hpp.changed', clear); document.removeEventListener('visibilitychange', hidden); };
+  }, [prefetch, environmentKey]);
+  useEffect(() => { if (!active || !fullPlayback || detailOpen) prefetch.clear(); }, [active, fullPlayback, detailOpen, prefetch]);
   const entry = host.library.find(e => libraryKey(e.pluginId, e.mediaId) === libraryKey(plugin.meta.id, mediaId));
   const canPlay = plugin.enabled && ["ready", "unloaded"].includes(plugin.status);
   const progress = useMemo(() => pluginProgressReporter(plugin.meta.id, mediaId, plugin.methods.includes("progress.report")), [plugin.meta.id, mediaId, plugin.revision]);
@@ -102,6 +131,7 @@ export default function PluginMediaDetail({ plugin, mediaId, onBack, manage, act
       if (!session.current || !canPlay) { autoStarted.current = false; startedFromSource.current = false; }
       progress.pause();
       sequence.current++; request.cancelAll();
+      transitioning.current = false;
       setBusy(false);
       if (!canPlay) { if (session.current) releaseMedia(session.current.sessionId); session.current = null; setMedia(null); }
       void saveRef.current().catch(e => setError(pluginError(e)));
@@ -114,37 +144,56 @@ export default function PluginMediaDetail({ plugin, mediaId, onBack, manage, act
   const play = async (ep: Episode, reason: "play" | "refresh" | "switch" | "fallback" = "play", listId: string | undefined = playlist || undefined, chosen = selection.current, proposedPosition?: number) => {
     if (!viewActive.current || !canPlay) return;
     const n = ++sequence.current;
-    setBusy(true); setError("");
+    const started = performance.now();
+    setBusy(true); setError(""); transitioning.current = reason !== 'refresh';
+    if (reason !== 'refresh') { playing.current = false; progress.pause(); }
     if (reason !== "refresh") { void save().catch(() => {}); request.cancelAll(); }
     if (n !== sequence.current) return;
     setEpisode(ep);
-    if (session.current) releaseMedia(session.current.sessionId);
-    session.current = null; setMedia(null);
+    const previousSession = session.current;
     try {
       if (reason === "play") {
         setChoices(null);
         chosen = { ...chosen, streamIndex: 0, resolverStreamIndex: 0 };
-        const saved = await request<LocalProgress | null>("library.progress.get", { pluginId: plugin.meta.id, mediaId, playlistId: listId, episodeId: ep.id });
-        if (n !== sequence.current) return;
-        position.current = saved?.positionSec ?? proposedPosition ?? 0; refreshed.current = false;
-        progress.select(ep.id, position.current);
-        current.current = { ep, playlistId: listId };
       }
       if (reason === "switch") refreshed.current = false;
       if (reason === "play" || reason === "switch") attempted.current.clear();
       selection.current = chosen;
       const { serverId, ...options } = chosen;
-      const r = await request<PreparedMedia>("media.prepare", { id: plugin.meta.id, ...options, args: { mediaId, episodeId: ep.id, playlistId: listId, serverId, reason: reason === "refresh" ? "refresh" : "play", codecs: ["h264"] } });
+      const prepared = async () => {
+        if (reason === 'play') {
+          const cached = await prefetch.take(preparationKey(ep, listId, chosen));
+          if (cached) { playbackTiming(cached.sessionId, 'prepared-hit', started); return cached; }
+        } else prefetch.clear();
+        if (n !== sequence.current) throw { code: 'CANCELLED' };
+        return request<PreparedMedia>("media.prepare", { id: plugin.meta.id, ...options, args: { mediaId, episodeId: ep.id, playlistId: listId, serverId, reason: reason === "refresh" ? "refresh" : "play" } });
+      };
+      const [preparedResult, savedResult] = await Promise.allSettled([
+        prepared(),
+        reason === 'play' ? request<LocalProgress | null>('library.progress.get', { pluginId: plugin.meta.id, mediaId, playlistId: listId, episodeId: ep.id }) : Promise.resolve(null),
+      ]);
+      if (preparedResult.status === 'rejected') throw preparedResult.reason;
+      const r = preparedResult.value;
+      if (savedResult.status === 'rejected') { releaseMedia(r.sessionId); throw savedResult.reason; }
       if (n !== sequence.current) { releaseMedia(r.sessionId); return; }
+      if (reason === 'play') {
+        position.current = savedResult.value?.positionSec ?? proposedPosition ?? 0; refreshed.current = false;
+        progress.select(ep.id, position.current);
+        current.current = { ep, playlistId: listId };
+      }
       selection.current = rememberPlaybackSelection(r, chosen);
+      r.requestedAt = started;
       session.current = r; setMedia(r); setChoices(r.choices);
+      bufferAhead.current = 0; durationRef.current = 0; playing.current = false;
+      if (previousSession && previousSession.sessionId !== r.sessionId) releaseMedia(previousSession.sessionId);
+      playbackTiming(r.sessionId, 'prepared', started);
       void save().catch(e => setError(pluginError(e)));
       return r.choices.resolverRoute;
     } catch (e) {
-      if (n !== sequence.current) return; setError(pluginError(e));
+      if (n !== sequence.current) return; setEpisode(current.current?.ep || ep); setError(pluginError(e));
       const available = (e as { playbackChoices?: PreparedMedia["choices"] })?.playbackChoices;
       if (available) setChoices(available);
-    } finally { if (n === sequence.current) setBusy(false); }
+    } finally { if (n === sequence.current) { transitioning.current = false; setBusy(false); } }
   };
   useEffect(() => {
     if (!start || !detail || !active || !canPlay || startedFromSource.current) return;
@@ -203,6 +252,7 @@ export default function PluginMediaDetail({ plugin, mediaId, onBack, manage, act
     const c = current.current; if (c) void play(c.ep, "switch", c.playlistId, { ...selection.current, ...update });
   };
   const failed = () => {
+    if (busy) return;
     if (!active) { failedWhileHidden.current = true; return; }
     const c = current.current; if (!c) return;
     if (!refreshed.current) { refreshed.current = true; void play(c.ep, "refresh", c.playlistId); }
@@ -238,6 +288,27 @@ export default function PluginMediaDetail({ plugin, mediaId, onBack, manage, act
   const poster = useAssetUrls(plugin.meta.id, cover ? [cover] : [])[0];
   const previousEpisode = currentList?.episodes[(currentList?.episodes.findIndex(e=>e.id===episode?.id) ?? 0)-1];
   const nextEpisode = currentList?.episodes[(currentList?.episodes.findIndex(e=>e.id===episode?.id) ?? -1)+1];
+  const prepareNext = () => {
+    if (!active || document.hidden || !fullPlayback || detailOpen || busy || !playing.current || !currentList || !session.current || current.current?.playlistId !== currentList.id || current.current?.ep.id !== episode?.id || bufferAhead.current < Math.min(12, durationRef.current > 0 ? Math.max(2,durationRef.current-position.current-.2) : 12)) return;
+    if (!nextEpisode && currentList.next && plugin.methods.includes('media.listEpisodes')) {
+      const cursor = currentList.next, listId = currentList.id;
+      if (pagePending.current === JSON.stringify([listId, cursor])) return;
+      pagePending.current = JSON.stringify([listId, cursor]);
+      void metadataRequest.read<Page<Episode>>(plugin, 'media.listEpisodes', { mediaId, playlistId: listId, cursor, limit: 100 }).then(page => {
+        setDetail(d => d && ({ ...d, playlists: d.playlists.map(p => p.id !== listId || p.next !== cursor ? p : {
+          ...p, next: page.next === cursor ? null : page.next,
+          episodes: [...p.episodes, ...page.items.filter(e => !p.episodes.some(old => old.id === e.id))],
+        }) }));
+      }).catch(() => {});
+      return;
+    }
+    if (!nextEpisode || nextEpisode.locked) return;
+    const chosen = { ...selection.current, streamIndex: 0, resolverStreamIndex: 0 };
+    const { serverId, ...options } = chosen;
+    prefetch.offer(preparationKey(nextEpisode, currentList.id, chosen), { id: plugin.meta.id, ...options,
+      args: { mediaId, episodeId: nextEpisode.id, playlistId: currentList.id, serverId, reason: 'preload' },
+    }, durationRef.current > 0 && durationRef.current - position.current < 60);
+  };
   const advancing = useRef(false);
   const advanceEpisode = async (direction: number) => {
     if (busy || advancing.current || !active || !episode || !currentList) return;
@@ -299,7 +370,7 @@ export default function PluginMediaDetail({ plugin, mediaId, onBack, manage, act
   const favoriteAction = () => { const item = detail || entryItem; if (item) void host.put(plugin.meta.id,item,{favorite:!entry?.favorite}).catch(e=>setError(pluginError(e))); };
   return <div className={`legacy-media-page ${fullPlayback ? "hg-watching" : homePreview ? "hg-discovering" : "hg-detail-entry"}`}>
     {playbackRequested &&
-    <PluginPlayer {...presentation} playIntent={playIntent} mode={fullPlayback ? "full" : "preview"} onOpenDetail={openDetail} media={canPlay?media:null} active={active && !detailOpen} position={position.current} error={error} onRetry={refresh}
+    <PluginPlayer {...presentation} playIntent={playIntent} mode={fullPlayback ? "full" : "preview"} onOpenDetail={openDetail} media={canPlay?media:null} preparing={busy && (transitioning.current || !media)} active={active && !detailOpen && !transitioning.current} position={position.current} error={error} onRetry={refresh}
       previousPreview={fullPlayback ? previousEpisode ? {title:previousEpisode.label || '上一集',poster} : undefined : presentation.previousPreview}
       nextPreview={fullPlayback ? nextEpisode ? {title:nextEpisode.label || '下一集',poster} : undefined : presentation.nextPreview}
       onPanelChange={panel=>{if(panel==='detail'||panel==='episodes')setNeedsDetail(true);}}
@@ -311,9 +382,12 @@ export default function PluginMediaDetail({ plugin, mediaId, onBack, manage, act
       onPreviousEpisode={!busy&&previousEpisode&&!previousEpisode.locked?()=>void advanceEpisode(-1):undefined}
       onNextEpisode={!busy&&((nextEpisode&&!nextEpisode.locked)||(!nextEpisode&&currentList?.next&&plugin.methods.includes('media.listEpisodes')))?()=>void advanceEpisode(1):undefined}
       panels={{detail:detailPanel,episodes:episodesPanel,playback:playbackPanel,comments:plugin.methods.includes("comments.list")?<CommentsPanel embedded plugin={plugin} mediaId={mediaId} episodeId={current.current?.ep.id}/>:undefined}}
-      onPosition={(t,duration)=>{position.current=t;progress.update(t,duration);if(Date.now()-lastSave.current>5000){lastSave.current=Date.now();void save().catch(e=>setError(pluginError(e)));}}}
-      onPlaying={progress.playing} onStopped={()=>{progress.pause();void save().catch(e=>setError(pluginError(e)));}}
-      onEnded={()=>{progress.end();void save().catch(()=>{});if(active&&host.prefs.autoNext){if(fullPlayback)void advanceEpisode(1);else presentation.onNext?.();}}} onFailure={failed}/>}
+      onPosition={(t,duration)=>{if(transitioning.current || media?.sessionId!==session.current?.sessionId)return;position.current=t;durationRef.current=duration||0;progress.update(t,duration);prepareNext();if(Date.now()-lastSave.current>5000){lastSave.current=Date.now();void save().catch(e=>setError(pluginError(e)));}}}
+      onBuffer={seconds=>{bufferAhead.current=seconds;prepareNext();}}
+      onWaiting={()=>{playing.current=false;prefetch.stopWarm();}}
+      onPlaying={()=>{if(transitioning.current || media?.sessionId!==session.current?.sessionId)return;playing.current=true;progress.playing();prepareNext();}}
+      onStopped={()=>{playing.current=false;prefetch.stopWarm();if(transitioning.current || media?.sessionId!==session.current?.sessionId)return;progress.pause();void save().catch(e=>setError(pluginError(e)));}}
+      onEnded={()=>{if(transitioning.current || media?.sessionId!==session.current?.sessionId)return;progress.end();void save().catch(()=>{});if(active&&host.prefs.autoNext){if(fullPlayback)void advanceEpisode(1);else presentation.onNext?.();}}} onFailure={failed}/>}
     {detailOpen && active && <MediaDetailSheet item={detail || entryItem || null} poster={poster} source={plugin.meta.name}
       favorite={!!entry?.favorite} onFavorite={favoriteAction} onClose={()=>{setDetailOpen(false);if(!homePreview&&!fullPlayback)onBack?.();}}
       onPlay={beginPlayback} busy={busy || !canPlay || !detail || (!media && !currentList?.episodes.some(ep=>!ep.locked) && !currentList?.next)}

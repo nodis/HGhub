@@ -29,9 +29,19 @@ pub async fn dispatch(
         return manager.library.operation(action, p);
     }
     let value = match action.as_str() {
+        "host.media.configure" => json!({"changed": manager.configure_media(
+            serde_json::from_value(p.clone()).map_err(|_| PluginError::invalid("播放能力格式无效"))?
+        ).await?}),
         "proxy.get" => crate::proxy::get(),
-        "proxy.set" => crate::proxy::set(text(p, "mode")?, p["url"].as_str().unwrap_or("")).map_err(PluginError::invalid)?,
-        "proxy.test" => crate::proxy::probe(text(p, "mode")?, p["url"].as_str().unwrap_or(""), text(p, "target")?).await.map_err(PluginError::invalid)?,
+        "proxy.set" => crate::proxy::set(text(p, "mode")?, p["url"].as_str().unwrap_or(""))
+            .map_err(PluginError::invalid)?,
+        "proxy.test" => crate::proxy::probe(
+            text(p, "mode")?,
+            p["url"].as_str().unwrap_or(""),
+            text(p, "target")?,
+        )
+        .await
+        .map_err(PluginError::invalid)?,
         "list" => json!(manager.list().await),
         "updates.state" => json!(manager.refresh_update_state().await?),
         "updates.policy.set" => json!(manager.update_policy_set(
@@ -254,6 +264,21 @@ pub async fn dispatch(
                 )
                 .await?
         ),
+        "media.preload" => {
+            manager
+                .preload_media(
+                    text(p, "sessionId")?,
+                    p["positionSec"]
+                        .as_f64()
+                        .filter(|v| v.is_finite() && *v >= 0.0)
+                        .unwrap_or(0.0),
+                )
+                .await?
+        }
+        "media.preload.cancel" => {
+            manager.sessions.cancel_preload(text(p, "sessionId")?);
+            Value::Null
+        }
         "media.release" => {
             manager.sessions.release(text(p, "sessionId")?);
             Value::Null

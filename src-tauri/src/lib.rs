@@ -39,9 +39,8 @@ pub fn run() {
                     .with_document_reader(std::sync::Arc::new(plugins::PickedDocuments(app.handle().clone()))),
             );
             app.manage(manager.clone());
-            tauri::async_runtime::spawn(async move {
-                manager.initialize_enabled().await;
-            });
+            // The WebView registers its playback capabilities before the first
+            // plugin command; eager initialization would expose an incorrect env.
             #[cfg(target_os = "macos")]
             macos_titlebar::create_main_window(app)?;
             Ok(())

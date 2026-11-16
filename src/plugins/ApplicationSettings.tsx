@@ -3,7 +3,9 @@ import { playbackSources, SourcePicker } from "./ImmersiveHome";
 import { IBack, IChevR, IGrid, ISettings, IMoon, ISun, IVolMute, IPlayF, IRefresh, ILockF, IHeart, IInfo } from "../icons";
 import type { ReactNode } from "react";
 import { Toggle } from "../components/ui";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
+import { checkAppUpdate, type AppRelease } from "../appUpdates";
 import { useStore } from "../store";
 import { APP_VERSION } from "../environment";
 import { useHost } from "./HostContext";
@@ -56,12 +58,56 @@ export default function ApplicationSettings({ onBack }: { onBack: () => void }) 
         </div></details>
       </Section>
       <Section title="网络"><ProxySettings/><Setting icon={<ILockF size={16}/>} title="严格安全模式" description="用于插件与媒体请求。自建服务需要访问局域网时可关闭。"><Toggle label="严格安全模式" on={app.strictSecurity} disabled={!app.strictSecurityReady||app.securityPending} onChange={on=>void app.setStrictSecurity(on).catch(e=>setError(pluginError(e)))}/></Setting></Section>
-      <Section title="关于"><Setting icon={<IInfo size={16}/>} title={`HGhub ${APP_VERSION}`} description="由用户自行导入内容源与解析器的插件视频播放器"/></Section>
+      <Section title="关于"><Setting icon={<IInfo size={16}/>} title={`HGhub ${APP_VERSION}`} description="由用户自行导入内容源与解析器的插件视频播放器"/><AppUpdateSetting/></Section>
     </div></div>
     {picker&&<SourcePicker plugins={available} close={()=>setPicker(false)} manage={()=>app.push({kind:"plugins"})}/>}
   </div>;
 }
 
+function AppUpdateSetting() {
+  const [checking, setChecking] = useState(false), [opening, setOpening] = useState(false);
+  const [message, setMessage] = useState("手动检查 GitHub 正式 Release"), [error, setError] = useState("");
+  const [release, setRelease] = useState<AppRelease | null>(null);
+  const active = useRef<AbortController | null>(null);
+  useEffect(() => () => { active.current?.abort(); active.current = null; }, []);
+  const check = async () => {
+    if (active.current) return;
+    const controller = new AbortController();
+    active.current = controller;
+    setChecking(true); setError(""); setRelease(null); setMessage("正在检查更新…");
+    const timeout = window.setTimeout(() => controller.abort(), 15_000);
+    try {
+      const result = await checkAppUpdate(APP_VERSION, controller.signal);
+      if (active.current !== controller) return;
+      setRelease(result);
+      setMessage(result ? result.available ? `发现新版本 ${result.tag}` : `暂无更新 · 最新发布 ${result.tag}` : "暂无正式发布版本");
+    } catch (e) {
+      if (active.current !== controller) return;
+      setMessage("检查未完成");
+      setError(controller.signal.aborted ? "检查超时，请重试" : e instanceof Error ? e.message : "检查更新失败，请重试");
+    } finally {
+      window.clearTimeout(timeout);
+      if (active.current === controller) { active.current = null; setChecking(false); }
+    }
+  };
+  const open = async () => {
+    if (!release || opening) return;
+    setOpening(true); setError("");
+    try { await invoke<void>("open_url", { url: release.url }); }
+    catch { setError("无法打开浏览器，请重试"); }
+    finally { setOpening(false); }
+  };
+  return <div>
+    <Setting icon={<IRefresh size={16}/>} title="检查更新" description={<span role="status">{message}</span>}>
+      <div className="flex flex-col items-end gap-2 text-[12px] text-primary">
+        {release?.available && <button className="pressable disabled:opacity-50" disabled={opening || checking} onClick={() => void open()}>{opening ? "正在打开…" : "前往 Release"}</button>}
+        <button className="pressable disabled:opacity-50" disabled={checking || opening} onClick={() => void check()}>{checking ? "检查中…" : release ? "重新检查" : "检查更新"}</button>
+      </div>
+    </Setting>
+    {error && <div className="px-3.5 pb-3"><Notice error={error}/></div>}
+  </div>;
+}
+
 // Reused Settings row/section structure from 5f88442.
 function Section({title,children}:{title:string;children:ReactNode}) {return <><h2 className="text-[10.5px] font-semibold text-dim tracking-wide px-1 mt-4 mb-1.5">{title}</h2><section className="rounded-(--r-md) bg-s2 divide-y divide-s3">{children}</section></>;}
-function Setting({icon,title,description,children}:{icon:ReactNode;title:string;description:string;children?:ReactNode}) {return <div className="flex items-center gap-3 px-3.5 py-3"><span className="shrink-0 w-8 h-8 rounded-full bg-s3 flex items-center justify-center text-primary">{icon}</span><div className="flex-1 min-w-0"><div className="text-[12.5px] text-on">{title}</div><div className="text-[10.5px] text-mut">{description}</div></div><div className="shrink-0 flex">{children}</div></div>;}
+function Setting({icon,title,description,children}:{icon:ReactNode;title:string;description:ReactNode;children?:ReactNode}) {return <div className="flex items-center gap-3 px-3.5 py-3"><span className="shrink-0 w-8 h-8 rounded-full bg-s3 flex items-center justify-center text-primary">{icon}</span><div className="flex-1 min-w-0"><div className="text-[12.5px] text-on">{title}</div><div className="text-[10.5px] text-mut">{description}</div></div><div className="shrink-0 flex">{children}</div></div>;}

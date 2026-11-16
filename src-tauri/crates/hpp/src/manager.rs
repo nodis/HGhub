@@ -65,6 +65,7 @@ pub struct PluginInfo {
     pub revision: String,
 }
 pub struct PluginManager {
+    media_capabilities: Mutex<crate::capabilities::MediaCapabilities>,
     root: PathBuf,
     document_reader: Option<Arc<dyn DocumentReader>>,
     plugins: tokio::sync::RwLock<BTreeMap<String, Arc<tokio::sync::Mutex<Installed>>>>,
@@ -122,6 +123,7 @@ impl PluginManager {
             root.join("resolver-preferences.json"),
         )?;
         Ok(Self {
+            media_capabilities: Default::default(),
             root,
             document_reader: None,
             plugins: tokio::sync::RwLock::new(plugins),
@@ -139,6 +141,40 @@ impl PluginManager {
     pub fn with_document_reader(mut self, reader: Arc<dyn DocumentReader>) -> Self {
         self.document_reader = Some(reader);
         self
+    }
+    pub async fn configure_media(
+        &self,
+        media: crate::capabilities::MediaCapabilities,
+    ) -> Result<bool> {
+        media.validate()?;
+        let _playback = self.playback_gate.write().await;
+        let _mutation = self.mutation.lock().await;
+        {
+            let mut current = self.media_capabilities.lock().unwrap();
+            if *current == media {
+                return Ok(false);
+            }
+            *current = media;
+        }
+        // Environment is a load-time snapshot: cancel old workers and sessions;
+        // the next list/call initializes using the new capabilities.
+        let plugins = self
+            .plugins
+            .read()
+            .await
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for plugin in plugins {
+            let mut p = plugin.lock().await;
+            if let Some(worker) = p.worker.take() {
+                worker.stop();
+            }
+            self.sessions.release_plugin(&p.entry.meta.id);
+            p.revision = uuid::Uuid::new_v4().to_string();
+            p.error = None;
+        }
+        Ok(true)
     }
     fn installed(
         dir: PathBuf,
@@ -219,6 +255,7 @@ impl PluginManager {
                     "crypto.hmac",
                     "crypto.aesEncrypt",
                     "crypto.aesDecrypt",
+                    "crypto.rsaEncrypt",
                     "crypto.randomBytes",
                     "crypto.randomUUID",
                     "codec.base64Encode",
@@ -283,6 +320,7 @@ impl PluginManager {
                 p.store.clone(),
                 p.network.clone(),
                 p.logs.clone(),
+                self.media_capabilities.lock().unwrap().clone(),
             )
         };
         let mut w = spawn(p.entry.endpoint.clone()).await?;
@@ -630,7 +668,7 @@ impl PluginManager {
         &self,
         id: &str,
         method: &str,
-        params: Transfer,
+        mut params: Transfer,
         request_id: String,
     ) -> Result<Transfer> {
         if request_id.is_empty() || request_id.len() > 128 {
@@ -644,6 +682,15 @@ impl PluginManager {
             let w = self.initialize(&mut p, full).await?;
             if !w.methods.iter().any(|m| m == method) {
                 return Err(PluginError::new("UNSUPPORTED", "插件未实现该方法"));
+            }
+            if matches!(
+                method,
+                "media.resolvePlayback" | "live.resolve" | "resolver.resolve"
+            ) {
+                let Transfer::Object(ref mut fields) = params else {
+                    return Err(PluginError::invalid("播放参数必须是对象"));
+                };
+                fields.insert("codecs".into(), Transfer::from_json(json!(w.media.codecs)));
             }
             (w, p.entry.meta.clone(), p.logs.clone())
         };

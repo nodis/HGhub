@@ -194,7 +194,13 @@ impl Engine {
             .map_err(|e| self.error(e))
             .and_then(Meta::parse)
     }
-    fn install(&self, meta: &Meta, settings: &Value, endpoint: &Value) -> Result<Vec<String>> {
+    fn install(
+        &self,
+        meta: &Meta,
+        settings: &Value,
+        endpoint: &Value,
+        media: &crate::capabilities::MediaCapabilities,
+    ) -> Result<Vec<String>> {
         *self.slice.borrow_mut() = Instant::now();
         self.context
             .with(|ctx| -> rquickjs::Result<String> {
@@ -208,7 +214,8 @@ impl Engine {
                     .restore(&ctx)?;
                 let p: rquickjs::Promise = install.call((
                     factory,
-                    json!({"meta":meta,"settings":settings,"endpoint":endpoint}).to_string(),
+                    json!({"meta":meta,"settings":settings,"endpoint":endpoint,"media":media})
+                        .to_string(),
                 ))?;
                 p.finish()
             })
@@ -294,6 +301,7 @@ pub struct Worker {
     slots: Arc<Semaphore>,
     fault: Arc<Mutex<Option<PluginError>>>,
     pub methods: Vec<String>,
+    pub media: crate::capabilities::MediaCapabilities,
 }
 impl Worker {
     pub async fn spawn(
@@ -304,6 +312,7 @@ impl Worker {
         store: Arc<Store>,
         network: Arc<Network>,
         logs: Logs,
+        media: crate::capabilities::MediaCapabilities,
     ) -> Result<Self> {
         let (sender, mut receiver) = mpsc::channel::<Command>(40);
         let (ready_tx, ready_rx) = oneshot::channel();
@@ -314,6 +323,7 @@ impl Worker {
         let fault = Arc::new(Mutex::new(None));
         let thread_fault = fault.clone();
         let thread_name = format!("hpp:{}", meta.id);
+        let thread_media = media.clone();
         let run_worker = move || {
             let rt = match tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -329,7 +339,7 @@ impl Worker {
                 let make = || {
                     let e = Engine::new(logs.clone(), token_map.clone(), stop.clone())?;
                     e.inspect(&source)?;
-                    let methods = e.install(&meta, &settings, &endpoint)?;
+                    let methods = e.install(&meta, &settings, &endpoint, &thread_media)?;
                     Ok::<_, PluginError>((e, methods))
                 };
                 let (mut engine, methods) = match make() {
@@ -564,6 +574,7 @@ impl Worker {
             shutdown,
             slots: Arc::new(Semaphore::new(40)),
             methods,
+            media,
             fault,
         })
     }

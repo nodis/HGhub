@@ -13,7 +13,9 @@ Deliver one self-contained UTF-8 ES module with meta and a default factory. Only
 
 Preserve upstream media, playlist, episode, category and server IDs. List position is not identity. Encode pagination state in returned cursors, not closure state. Respect ctx cancellation and do not schedule background work.
 
-Check features or method presence for optional behavior. Put indispensable APIs in meta.requires. Do not claim RSA, WebView, DASH, download or platform playback support from a type declaration alone.
+Check features or method presence for optional behavior. Put indispensable APIs in meta.requires. RSA encryption is implemented in the native host (1024–8192-bit SPKI/PKCS#1 PEM; PKCS1/OAEP-SHA1/OAEP-SHA256); declare crypto.rsaEncrypt in meta.requires when indispensable. The in-memory mock still requires an injected crypto adapter. Do not claim WebView, DASH, download or platform playback support from a type declaration alone.
+
+Use hg.env.media and the supplied playback params.codecs; the client probes its WebView playback paths and reports a conservative codec intersection, which may be empty. Capability API results do not guarantee every profile or device playback. Headless/mock tests must inject media capabilities explicitly.
 
 Map user-facing failures to hg.PluginError; distinguish upstream rejection from changed successful response shapes. Keep logs free of credentials and signed URLs.
 

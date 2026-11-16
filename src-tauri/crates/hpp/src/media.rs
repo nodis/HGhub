@@ -27,11 +27,17 @@ use std::{
 use tokio_util::sync::CancellationToken;
 
 const MAX_RESOURCE: usize = 8 * 1024 * 1024;
+static MEDIA_TRANSFERS: once_cell::sync::Lazy<Arc<tokio::sync::Semaphore>> =
+    once_cell::sync::Lazy::new(|| Arc::new(tokio::sync::Semaphore::new(6)));
+static IMAGE_TRANSFERS: once_cell::sync::Lazy<Arc<tokio::sync::Semaphore>> =
+    once_cell::sync::Lazy::new(|| Arc::new(tokio::sync::Semaphore::new(2)));
+mod preload;
 #[derive(Default)]
 pub struct MediaSessions {
     sessions: Mutex<HashMap<String, Arc<Session>>>,
     base: tokio::sync::OnceCell<String>,
     shutdown: CancellationToken,
+    preload_gate: tokio::sync::Mutex<()>,
 }
 struct Session {
     playback: AtomicBool,
@@ -39,6 +45,7 @@ struct Session {
     cancel: CancellationToken,
     resources: Mutex<Vec<Resource>>,
     expires_at: Option<u64>,
+    cache: preload::Cache,
 }
 #[derive(Clone, PartialEq)]
 struct Resource {
@@ -102,6 +109,11 @@ impl MediaSessions {
             .ok_or_else(|| PluginError::new("NOT_FOUND", "媒体会话已释放"))?;
         session.playback.store(playing, Ordering::Release);
         Ok(())
+    }
+    pub fn cancel_preload(&self, id: &str) {
+        if let Some(s) = self.sessions.lock().unwrap().get(id) {
+            s.cache.cancel();
+        }
     }
     pub fn release_plugin(&self, id: &str) {
         self.sessions.lock().unwrap().retain(|_, s| {
@@ -277,6 +289,7 @@ impl PluginManager {
             cancel: CancellationToken::new(),
             resources: Mutex::new(vec![]),
             expires_at: None,
+            cache: Default::default(),
         });
         let id = uuid::Uuid::new_v4().to_string();
         let mut urls = vec![];
@@ -568,11 +581,12 @@ impl PluginManager {
             ));
         }
         let session = Arc::new(Session {
-            playback: AtomicBool::new(true),
+            playback: AtomicBool::new(params["reason"] != "preload"),
             providers,
             cancel: CancellationToken::new(),
             resources: Mutex::new(vec![]),
             expires_at: playback["expiresAt"].as_u64(),
+            cache: Default::default(),
         });
         let root = session.register(resource(
             &provider,
@@ -670,7 +684,27 @@ async fn serve_resource(
             .get(index)
             .cloned()
             .ok_or_else(|| PluginError::new("NOT_FOUND", "媒体资源不存在"))?;
-        proxy(&manager, &session, &id, resource, method, headers).await
+        let gate = if resource.kind == "image" {
+            &*IMAGE_TRANSFERS
+        } else {
+            // Foreground media can interrupt speculative I/O, not just jump a queue.
+            for candidate in manager.sessions.sessions.lock().unwrap().values() {
+                candidate.cache.cancel();
+            }
+            &*MEDIA_TRANSFERS
+        };
+        let permit = tokio::select! {
+            _ = session.cancel.cancelled() => return Err(PluginError::cancelled()),
+            value = gate.clone().acquire_owned() => value.map_err(|_| PluginError::cancelled())?,
+        };
+        let response = proxy(&manager, &session, &id, resource, method, headers).await?;
+        let (parts, body) = response.into_parts();
+        // Keep the permit for the streamed body, not only until response headers.
+        let stream = body.into_data_stream().map(move |chunk| {
+            let _keep = &permit;
+            chunk
+        });
+        Ok(Response::from_parts(parts, Body::from_stream(stream)))
     }
     .await;
     cors(result.unwrap_or_else(|e| {
@@ -694,6 +728,20 @@ async fn proxy(
     r: Resource,
     method: Method,
     incoming: HeaderMap,
+) -> Result<Response<Body>> {
+    if let Some(response) = preload::cached(manager, session, id, &r, &method, &incoming).await? {
+        return Ok(response);
+    }
+    proxy_upstream(manager, session, id, r, method, incoming, MAX_RESOURCE).await
+}
+async fn proxy_upstream(
+    manager: &Arc<PluginManager>,
+    session: &Arc<Session>,
+    id: &str,
+    r: Resource,
+    method: Method,
+    incoming: HeaderMap,
+    buffer_limit: usize,
 ) -> Result<Response<Body>> {
     let network = &session.providers[&r.provider].0;
     let transform = r.transforms.get(&r.kind).filter(|v| !v.is_null());
@@ -767,8 +815,8 @@ async fn proxy(
         let Some(chunk) = chunk else {
             break;
         };
-        if data.len() + chunk.len() > MAX_RESOURCE {
-            return Err(PluginError::invalid("媒体资源超过 8 MiB"));
+        if data.len() + chunk.len() > buffer_limit {
+            return Err(PluginError::invalid("媒体资源超过缓冲预算"));
         }
         data.extend_from_slice(&chunk);
     }
